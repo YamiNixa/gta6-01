@@ -11,6 +11,8 @@ import { createPolice } from './police.js';
 import { createMissions } from './missions.js';
 import { createCombat } from './combat.js';
 import { createSave } from './save.js';
+import { createHUD } from './hud.js';
+import { createAudio } from './audio.js';
 
 // ---------------------------------------------------------------- state
 // The one shared state object. Later slices read and write these fields;
@@ -22,6 +24,7 @@ export const state = {
   health: 100,
   mission: null,        // owned by the mission slice; a stub object in ?shot=mission
   inCar: false,
+  paused: false,
   timeMinutes: 16 * 60 + 20, // late afternoon
   carName: null,
 };
@@ -68,6 +71,8 @@ function handleBusted() {
   state.money = Math.max(0, state.money - 150);
   state.health = Math.max(state.health, 50);
   player.pos.set(world.playerSpawn.x, 0, world.playerSpawn.z);
+  if (hud) { hud.showBanner('BUSTED', 1800); }
+  if (audio) audio.play('fail');
   hooks.updateHUD();
 }
 function handleDeath() {
@@ -81,6 +86,8 @@ function handleDeath() {
   state.health = 100;
   player.pos.set(world.playerSpawn.x, 0, world.playerSpawn.z);
   toast('You were taken out — $100 hospital bill. Back at the Marina.');
+  if (hud) hud.showBanner('WASTED', 1800);
+  if (audio) audio.play('fail');
   hooks.updateHUD();
 }
 const police = createPolice(scene, world, {
@@ -102,6 +109,8 @@ const combat = createCombat(scene, world, {
   addCrime: (stars, label) => police.addCrime(stars, label),
   onPlayerDeath: handleDeath,
   onEnemyKilled: (enemy) => hooks.onMissionEvent('enemy-down', { name: enemy.name }),
+  onShoot: () => { muzzleFlash(); audio && audio.play('shot'); },
+  onPunch: () => { audio && audio.play('punch'); },
 });
 const missions = createMissions(scene, world, {
   state,
@@ -141,6 +150,48 @@ const saveSys = createSave({
   toast,
 });
 
+// ---------------------------------------------------------------- hud+audio
+// Slice 3: the HUD reads the shared state and the live positions; the
+// audio engine synthesises every sound. Both are created here so the
+// hooks above can reach them.
+const audio = createAudio();
+let flashLight = null;
+let flashTime = 0;
+function muzzleFlash() {
+  if (!flashLight) {
+    flashLight = new THREE.PointLight(0xffc860, 0, 14);
+    scene.add(flashLight);
+  }
+  const p = livePos();
+  flashLight.position.set(p.x, 1.6, p.z);
+  flashLight.intensity = 26;
+  flashTime = 0.07;
+}
+const hud = createHUD({
+  state,
+  world,
+  getPlayerPos: livePos,
+  getCamYaw: () => camYaw,
+  getSpeed: () => (vehicles.current ? vehicles.current.speed : player.speed),
+  getAmmo: () => ({ mag: combat.ammo, reserve: combat.reserve }),
+  getMissionTarget: () => missions.getTarget(),
+  getTrafficCars: () => traffic.cars,
+  getPeds: () => traffic.peds,
+  getPolice: () => police.units,
+  getParkedCars: () => vehicles.cars.filter((c) => c.parked),
+});
+hooks.updateHUD = () => hud.refresh();
+hooks.playSound = (name) => audio.play(name);
+hooks.onWantedChange = (level) => { if (level > 0) hud.showBanner(`WANTED — ${level} STAR${level > 1 ? 'S' : ''}`, 1200); };
+hooks.onMissionEvent = (name, data) => {
+  if (name === 'complete') { audio.play('mission'); hud.showBanner('JOB DONE', 1400); }
+  else if (name === 'failed') { audio.play('fail'); hud.showBanner('JOB FAILED', 1400); }
+  else if (name === 'started') { audio.play('mission'); }
+  hud.refresh();
+};
+hooks.onEnterCar = () => audio.play('enter');
+hooks.onExitCar = () => audio.play('click');
+
 // Mission marker stub: a glowing ring at the meeting point. Slice 2 turns
 // it into a real objective; slice 1 only shows where to stand.
 const marker = new THREE.Mesh(
@@ -160,6 +211,12 @@ let pointerLocked = false;
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyS' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveGame(); return; }
+  if ((e.code === 'KeyP' || e.code === 'Escape') && state.phase === 'playing') {
+    state.paused = !state.paused;
+    hud.setPaused(state.paused);
+    audio.play('click');
+    return;
+  }
   keys.add(e.code);
   if (e.code === 'KeyE' && state.phase === 'playing') toggleCar();
   if (e.code === 'KeyM' && state.phase === 'playing') missions.startCurrent();
@@ -263,12 +320,20 @@ function applyShot(shot) {
 
 // ---------------------------------------------------------------- start
 const startScreen = document.getElementById('start-screen');
+try {
+  if (localStorage.getItem(SAVE_KEY)) {
+    document.getElementById('save-note').textContent = 'A saved game was found — click to continue where you left off.';
+  }
+} catch { /* storage unavailable — fresh start */ }
 let saveLoaded = false;
 function beginPlay() {
   if (state.phase === 'playing') return;
   if (!shot && !saveLoaded) { saveLoaded = true; loadGame(); }
   state.phase = 'playing';
   startScreen.style.display = 'none';
+  audio.unlock();
+  audio.play('click');
+  hud.refresh();
   lockPointer();
 }
 startScreen.addEventListener('click', beginPlay);
@@ -323,17 +388,27 @@ window.__game = {
       peds: traffic.peds.map((p) => ({ x: +p.pos.x.toFixed(1), z: +p.pos.z.toFixed(1) })),
     };
   },
+  // Slice 3 test hooks: HUD and audio.
+  get hudReady() { return !!document.getElementById('minimap'); },
+  get audioRunning() { return audio.running; },
+  get paused() { return state.paused; },
+  togglePause() { state.paused = !state.paused; hud.setPaused(state.paused); return state.paused; },
+  showBanner(t) { hud.showBanner(t); return true; },
   shot: shot || 'start',
 };
 window.addEventListener('error', (e) => window.__game.errors.push(String(e.message)));
 
 // ---------------------------------------------------------------- loop
-const clock = new THREE.Clock();
+// Delta time from performance.now() (THREE.Clock is deprecated in the
+// vendored build and logs a warning on every call).
+let lastT = performance.now();
 let frames = 0;
 function loop() {
   requestAnimationFrame(loop);
-  const dt = Math.min(clock.getDelta(), 0.05);
-  if (state.phase === 'playing') {
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+  if (state.phase === 'playing' && !state.paused) {
     arrowCamera(dt);
     traffic.update(dt);
     police.update(dt);
@@ -347,6 +422,18 @@ function loop() {
       updateCamera(camera, player.pos, camYaw, camPitch, 7);
     }
     marker.rotation.z += dt * 0.8;
+  }
+  if (flashTime > 0) {
+    flashTime -= dt;
+    if (flashTime <= 0 && flashLight) flashLight.intensity = 0;
+  }
+  if (state.phase === 'playing') {
+    hud.refresh();
+    audio.update(dt, {
+      wanted: state.wanted,
+      inCar: state.inCar,
+      speed: vehicles.current ? vehicles.current.speed : player.speed,
+    });
   }
   renderer.render(scene, camera);
   frames++;

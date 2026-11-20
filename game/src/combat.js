@@ -97,6 +97,7 @@ export function createCombat(scene, world, api) {
   function punch() {
     if (punchCd > 0 || api.isInCar()) return;
     punchCd = PUNCH_CD;
+    api.onPunch && api.onPunch();
     const aim = api.getAimYaw();
     const p = api.getPlayerPos();
     // Enemies first: a swing connects with any foe in reach.
@@ -127,6 +128,7 @@ export function createCombat(scene, world, api) {
     if (api.isInCar()) return;
     if (ammo <= 0) { api.toast('Out of ammo — press R to reload.'); return; }
     ammo--;
+    api.onShoot && api.onShoot();
     const aim = api.getAimYaw();
     const p = api.getPlayerPos();
     let best = null, bestD = PISTOL_RANGE;

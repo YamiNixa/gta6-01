@@ -203,8 +203,14 @@ export function createMissions(scene, world, api) {
   }
 
   syncState();
+  function getTarget() {
+    if (status !== 'active') return null;
+    const s = step();
+    return s && s.pos ? stepPos(s) : null;
+  }
+
   return {
-    defs: MISSION_DEFS, update, startMission, startCurrent, getProgress, setProgress,
+    defs: MISSION_DEFS, update, startMission, startCurrent, getProgress, setProgress, getTarget,
     get current() { return idx < MISSION_DEFS.length ? { id: def().id, title: def().title, status, step: stepIdx } : null; },
   };
 }

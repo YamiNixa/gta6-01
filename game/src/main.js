@@ -7,6 +7,10 @@ import { buildWorld } from './world.js';
 import { createPlayer, updatePlayer, updateCamera } from './player.js';
 import { createVehicleSystem, updateDrive } from './vehicles.js';
 import { createTraffic } from './traffic.js';
+import { createPolice } from './police.js';
+import { createMissions } from './missions.js';
+import { createCombat } from './combat.js';
+import { createSave } from './save.js';
 
 // ---------------------------------------------------------------- state
 // The one shared state object. Later slices read and write these fields;
@@ -51,6 +55,92 @@ const player = createPlayer(scene, world);
 const vehicles = createVehicleSystem(scene, world);
 const traffic = createTraffic(scene, world, vehicles);
 
+// Slice 2 systems: police, missions, combat, save. They share the state
+// object and the player's live position (on foot or in the car).
+const livePos = () => (state.inCar && vehicles.current ? vehicles.current.pos : player.pos);
+function handleBusted() {
+  if (vehicles.current) {
+    vehicles.exit();
+    state.inCar = false;
+    state.carName = null;
+    player.mesh.visible = true;
+  }
+  state.money = Math.max(0, state.money - 150);
+  state.health = Math.max(state.health, 50);
+  player.pos.set(world.playerSpawn.x, 0, world.playerSpawn.z);
+  hooks.updateHUD();
+}
+function handleDeath() {
+  if (vehicles.current) {
+    vehicles.exit();
+    state.inCar = false;
+    state.carName = null;
+    player.mesh.visible = true;
+  }
+  state.money = Math.max(0, state.money - 100);
+  state.health = 100;
+  player.pos.set(world.playerSpawn.x, 0, world.playerSpawn.z);
+  toast('You were taken out — $100 hospital bill. Back at the Marina.');
+  hooks.updateHUD();
+}
+const police = createPolice(scene, world, {
+  state,
+  getPlayerPos: livePos,
+  isInCar: () => state.inCar,
+  getPlayerSpeed: () => (vehicles.current ? vehicles.current.speed : player.speed),
+  toast,
+  onWantedChange: (level) => hooks.onWantedChange(level),
+  onBusted: handleBusted,
+});
+const combat = createCombat(scene, world, {
+  state,
+  getPlayerPos: livePos,
+  getAimYaw: () => camYaw,
+  isInCar: () => state.inCar,
+  getPeds: () => traffic.peds,
+  toast,
+  addCrime: (stars, label) => police.addCrime(stars, label),
+  onPlayerDeath: handleDeath,
+  onEnemyKilled: (enemy) => hooks.onMissionEvent('enemy-down', { name: enemy.name }),
+});
+const missions = createMissions(scene, world, {
+  state,
+  getPlayerPos: livePos,
+  isInCar: () => state.inCar,
+  toast,
+  onMissionEvent: (name, data) => hooks.onMissionEvent(name, data),
+  saveGame: () => saveSys.autoSave(),
+  spawnEnemy: (x, z, opts) => combat.spawnEnemy(x, z, { ...opts, mission: true }),
+  missionEnemiesAlive: () => combat.enemies.filter((e) => e.mission).length,
+});
+const saveSys = createSave({
+  state,
+  getPlayerPos: () => player.pos,
+  setPlayerPos: (x, z) => player.pos.set(x, 0, z),
+  getMissionProgress: () => missions.getProgress(),
+  setMissionProgress: (p) => missions.setProgress(p),
+  getAmmo: () => combat.ammo,
+  getReserve: () => combat.reserve,
+  setAmmo: (a, r) => combat.setAmmo(a, r),
+  getCarState: () => {
+    if (!vehicles.current) return null;
+    const car = vehicles.current;
+    return { index: vehicles.cars.indexOf(car), x: car.pos.x, z: car.pos.z, heading: car.heading };
+  },
+  setCarState: (c) => {
+    const car = vehicles.cars[c.index];
+    if (!car) return;
+    car.pos.set(c.x, 0, c.z);
+    car.heading = c.heading;
+    car.mesh.rotation.y = c.heading;
+    vehicles.enter(car);
+    state.inCar = true;
+    state.carName = car.name;
+    player.mesh.visible = false;
+  },
+  toast,
+});
+
 // Mission marker stub: a glowing ring at the meeting point. Slice 2 turns
 // it into a real objective; slice 1 only shows where to stand.
 const marker = new THREE.Mesh(
@@ -72,6 +162,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyS' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveGame(); return; }
   keys.add(e.code);
   if (e.code === 'KeyE' && state.phase === 'playing') toggleCar();
+  if (e.code === 'KeyM' && state.phase === 'playing') missions.startCurrent();
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => keys.clear());
@@ -113,7 +204,9 @@ function toggleCar() {
   } else {
     const car = vehicles.nearestCar(player.pos);
     if (!car) { toast('No car close enough — walk up to one and press E'); return; }
+    const wasParked = car.parked;
     vehicles.enter(car);
+    if (wasParked) police.addCrime(1, 'you stole a car');
     state.inCar = true;
     state.carName = car.name;
     player.mesh.visible = false;
@@ -133,30 +226,11 @@ function toast(msg) {
 }
 
 // ---------------------------------------------------------------- save
-// Minimal save: position, money, health and time to localStorage. The HUD
-// slice surfaces it; the shape is stable for later slices.
+// Save/load live in save.js; these are the thin wrappers the input and
+// the start screen call (Ctrl+S saves, missions auto-save on completion).
 const SAVE_KEY = 'porto-verde-save-v1';
-function saveGame() {
-  try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify({
-      x: player.pos.x, z: player.pos.z,
-      money: state.money, health: state.health, timeMinutes: state.timeMinutes,
-    }));
-    toast('Game saved.');
-  } catch { /* storage unavailable — play on without saving */ }
-}
-function loadGame() {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return false;
-    const s = JSON.parse(raw);
-    player.pos.set(s.x, 0, s.z);
-    state.money = s.money ?? state.money;
-    state.health = s.health ?? state.health;
-    state.timeMinutes = s.timeMinutes ?? state.timeMinutes;
-    return true;
-  } catch { return false; }
-}
+function saveGame() { return saveSys.save(); }
+function loadGame() { return saveSys.load(); }
 
 // ---------------------------------------------------------------- shots
 // Deterministic start states for screenshots (?shot=start|drive|chase|mission).
@@ -179,8 +253,8 @@ function applyShot(shot) {
       }
     }
   } else if (shot === 'mission') {
-    state.mission = { id: 'meet-rio', title: 'Meet Rio at Marina Verde park', status: 'active' };
-    marker.visible = true;
+    missions.startMission(0);
+    marker.visible = false;
     player.pos.set(world.missionPoint.x - 6, 0, world.missionPoint.z + 4);
     camYaw = Math.PI * 0.75;
   }
@@ -189,8 +263,10 @@ function applyShot(shot) {
 
 // ---------------------------------------------------------------- start
 const startScreen = document.getElementById('start-screen');
+let saveLoaded = false;
 function beginPlay() {
   if (state.phase === 'playing') return;
+  if (!shot && !saveLoaded) { saveLoaded = true; loadGame(); }
   state.phase = 'playing';
   startScreen.style.display = 'none';
   lockPointer();
@@ -221,6 +297,24 @@ window.__game = {
   get parkedCars() { return vehicles.cars.length; },
   get buildings() { return world.buildingCount; },
   get cars() { return vehicles.cars.map((c) => ({ name: c.name, x: c.pos.x, z: c.pos.z })); },
+  // Slice 2 test hooks: police, missions, combat and save.
+  get wanted() { return state.wanted; },
+  get policeUnits() { return police.units.length; },
+  get policePos() { return police.units.map((u) => ({ x: +u.pos.x.toFixed(1), z: +u.pos.z.toFixed(1) })); },
+  get missionPoint() { return { x: world.missionPoint.x, z: world.missionPoint.z }; },
+  get mission() { return state.mission; },
+  get enemies() { return combat.enemies.map((e) => ({ name: e.name, hp: e.hp, x: +e.pos.x.toFixed(1), z: +e.pos.z.toFixed(1) })); },
+  get ammo() { return combat.ammo; },
+  get money() { return state.money; },
+  get health() { return state.health; },
+  addCrime(n, label) { police.addCrime(n, label); return state.wanted; },
+  spawnEnemy(x, z, opts) { return combat.spawnEnemy(x, z, opts || {}); },
+  startMission(i) { missions.startMission(i); return state.mission; },
+  punch() { combat.punch(); return combat.enemies.map((e) => e.hp); },
+  shoot() { combat.shoot(); return { ammo: combat.ammo, enemies: combat.enemies.map((e) => e.hp) }; },
+  hurt(n) { combat.damagePlayer(n); return state.health; },
+  saveGame() { return saveGame(); },
+  loadGame() { return loadGame(); },
   // Test-only helpers: move the player (on foot) and read traffic state.
   teleport(x, z) { if (!state.inCar) player.pos.set(x, 0, z); return { x: player.pos.x, z: player.pos.z }; },
   get trafficState() {
@@ -242,6 +336,9 @@ function loop() {
   if (state.phase === 'playing') {
     arrowCamera(dt);
     traffic.update(dt);
+    police.update(dt);
+    missions.update(dt);
+    combat.update(dt);
     if (vehicles.current) {
       updateDrive(vehicles, world, keys, dt);
       updateCamera(camera, vehicles.current.pos, camYaw, camPitch, 9);

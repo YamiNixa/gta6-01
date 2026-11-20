@@ -15,7 +15,7 @@
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 // Outside the grader, MAKEFUN_OUTPUT_DIR stands in for /output.
 
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -23,9 +23,6 @@ import { buildDossier } from './vendor/makefun-game.ts';
 const repo = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const dest = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
-// Start from a clean folder so a stale file from an earlier run can never
-// leak into the entry.
-rmSync(dest, { recursive: true, force: true });
 mkdirSync(dest, { recursive: true });
 
 // The game itself: static files, no build step.
